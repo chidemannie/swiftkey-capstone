@@ -1,0 +1,354 @@
+---
+title: "SwiftKey Capstone: Exploratory Data Analysis (HC Corpora)"
+author: "Emmanuel Benyeogor"
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE,
+  message = FALSE,
+  warning = FALSE
+)
+
+# ---- Packages ----
+library(rstudioapi)
+library(stringi)
+library(stringr)
+library(data.table)
+library(ggplot2)
+
+knitr::opts_knit$set(root.dir = dirname(rstudioapi::getActiveDocumentContext()$path))
+
+set.seed(2026)
+```
+# Task 0: Understanding the problem
+## What data do we have? 
+The capstone uses the HC Corpora English datasets for blogs, news, and Twitter. The goal is to build an efficient next-word prediction model similar to those used in mobile smart keyboards. The final product is a Shiny application that returns the top predicted next word(s) for an input phrase.
+
+## Standard tools/models for this task
+A common baseline approach is an n-gram language model (unigrams, bigrams, trigrams, and 4-grams) combined with a backoff strategy for unseen word sequences. Text processing typically includes sampling, cleaning, tokenization, and frequency analysis.
+
+# Task 1: Basic dataset summaries (required quiz checks)
+
+```{r data-and-functions, include=FALSE}
+# ---- Locate en_US folder robustly ----
+candidates <- c(
+  "data_raw/final/en_US"
+)
+base_dir <- candidates[file.exists(candidates)][1]
+if (is.na(base_dir)) {
+  stop(
+    "Could not find en_US folder. Expected one of:\n",
+    paste(" -", candidates, collapse = "\n"),
+    "\n\nTip: confirm your unzip location in Finder and update candidates."
+  )
+}
+
+files <- c(
+  blogs   = file.path(base_dir, "en_US.blogs.txt"),
+  news    = file.path(base_dir, "en_US.news.txt"),
+  twitter = file.path(base_dir, "en_US.twitter.txt")
+)
+
+# Sanity check
+stopifnot(all(file.exists(files)))
+
+# ---- Helper functions ----
+file_size_mb <- function(path) as.numeric(file.info(path)$size) / (1024^2)
+
+scan_file_stats <- function(path, chunk_size = 50000) {
+  con <- file(path, open = "r", encoding = "UTF-8")
+  on.exit(close(con), add = TRUE)
+
+  total_lines <- 0L
+  max_chars   <- 0L
+  max_words   <- 0L
+
+  repeat {
+    x <- readLines(con, n = chunk_size, warn = FALSE)
+    if (length(x) == 0) break
+
+    total_lines <- total_lines + length(x)
+
+    lens <- stri_length(x)
+    max_chars <- max(max_chars, max(lens, na.rm = TRUE))
+
+    y <- stri_trim_both(stri_replace_all_regex(x, "\\s+", " "))
+    wcount <- ifelse(y == "" | is.na(y), 0L, stri_count_fixed(y, " ") + 1L)
+    max_words <- max(max_words, max(wcount, na.rm = TRUE))
+  }
+
+  list(lines = total_lines, max_chars = max_chars, max_words = max_words)
+}
+
+love_hate_ratio_twitter <- function(path, chunk_size = 50000) {
+  con <- file(path, open = "r", encoding = "UTF-8")
+  on.exit(close(con), add = TRUE)
+
+  love_lines <- 0L
+  hate_lines <- 0L
+
+  love_re <- "\\blove\\b"
+  hate_re <- "\\bhate\\b"
+
+  repeat {
+    x <- readLines(con, n = chunk_size, warn = FALSE)
+    if (length(x) == 0) break
+
+    # Spec says lowercase occurrences only: do NOT lowercase the text
+    love_lines <- love_lines + sum(stri_detect_regex(x, love_re))
+    hate_lines <- hate_lines + sum(stri_detect_regex(x, hate_re))
+  }
+
+  ratio <- if (hate_lines == 0) Inf else love_lines / hate_lines
+  list(love_lines = love_lines, hate_lines = hate_lines, ratio = ratio)
+}
+
+# ---- Sampling + cleaning for EDA ----
+read_sample_lines <- function(path, p = 0.01, max_lines = 60000, chunk_size = 50000) {
+  con <- file(path, open = "r", encoding = "UTF-8")
+  on.exit(close(con), add = TRUE)
+
+  out <- character()
+
+  repeat {
+    x <- readLines(con, n = chunk_size, warn = FALSE)
+    if (length(x) == 0) break
+
+    keep <- runif(length(x)) < p
+    out <- c(out, x[keep])
+
+    if (length(out) >= max_lines) {
+      out <- out[1:max_lines]
+      break
+    }
+  }
+  out
+}
+
+clean_text <- function(x) {
+  x <- stri_trans_tolower(x)
+  x <- str_replace_all(x, "http[s]?://\\S+|www\\.\\S+", " ")  # URLs
+  x <- str_replace_all(x, "[^a-z\\s']", " ")                  # keep letters/spaces/apostrophes
+  x <- str_replace_all(x, "\\s+", " ")
+  x <- str_trim(x)
+  x[nchar(x) > 0]
+}
+
+# Tokenize and word count helpers
+tokenize_words <- function(lines) {
+  unlist(strsplit(lines, "\\s+"), use.names = FALSE)
+}
+words_per_line <- function(lines) {
+  lengths(strsplit(lines, "\\s+"))
+}
+
+# n-gram builders (fast enough for sampled EDA)
+make_ngrams <- function(lines, n) {
+  toks <- str_split(lines, "\\s+")
+  grams <- vector("list", length(toks))
+  for (i in seq_along(toks)) {
+    w <- toks[[i]]
+    if (length(w) < n) next
+    idx <- seq_len(length(w) - n + 1)
+    grams[[i]] <- vapply(idx, function(j) paste(w[j:(j + n - 1)], collapse = " "),
+                         character(1))
+  }
+  unlist(grams, use.names = FALSE)
+}
+
+count_ngrams <- function(lines, n, top_k = 20) {
+  g <- make_ngrams(lines, n)
+  dt <- data.table(ngram = g)[, .N, by = ngram][order(-N)]
+  dt[1:min(top_k, .N)]
+}
+```
+
+
+```{r task1-summaries}
+cat("Using base_dir:", base_dir, "\n\n")
+
+# File size check
+blogs_mb <- file_size_mb(files["blogs"])
+cat(sprintf("en_US.blogs.txt size: %.2f MB\n\n", blogs_mb))
+
+# Line counts + longest line + max words per line
+stats <- lapply(files, scan_file_stats)
+stats
+
+overall_max_chars <- max(vapply(stats, `[[`, numeric(1), "max_chars"))
+overall_max_words <- max(vapply(stats, `[[`, numeric(1), "max_words"))
+
+cat(sprintf("\nLongest line (any of 3): %d characters\n", overall_max_chars))
+cat(sprintf("Max words in a line (any of 3): %d words\n\n", overall_max_words))
+
+# love/hate ratio in twitter (lowercase occurrences)
+lh <- love_hate_ratio_twitter(files["twitter"])
+lh
+cat(sprintf("\nLove/Hate ratio (twitter): %.2f (about %s)\n",
+            lh$ratio,
+            ifelse(is.finite(lh$ratio), round(lh$ratio), "Inf")))
+
+summary_table <- data.table(
+  Metric = c(
+    "Blogs file size (MB)",
+    "Blog lines", "News lines", "Twitter lines",
+    "Longest line (characters, any file)",
+    "Max words in a line (any file)",
+    "Twitter love lines",
+    "Twitter hate lines",
+    "Love/Hate ratio (twitter)"
+  ),
+  Value = c(
+    round(blogs_mb, 2),
+    stats$blogs$lines, stats$news$lines, stats$twitter$lines,
+    overall_max_chars,
+    overall_max_words,
+    lh$love_lines,
+    lh$hate_lines,
+    round(lh$ratio, 2)
+  )
+)
+
+summary_table
+```
+
+## Interpretation
+The three sources differ markedly: Twitter lines are short by design, while blogs can contain extremely long lines. This motivates representative sampling, consistent text cleaning, and efficient storage/lookup for n-grams to support a responsive Shiny app.
+
+# Task 2: Exploratory Data Analysis (EDA)
+## Create a sampled, cleaned dataset for EDA
+To keep analysis fast on a laptop, we use a random sample of lines from each dataset and apply conservative cleaning (lowercasing, URL removal, removing non-letter characters, and whitespace normalization).
+Sampling parameters for EDA (can be adjusted for larger samples)
+```{r sampling, echo=FALSE}
+P_SAMPLE   <- 0.01   # 1% line sampling
+MAX_LINES  <- 60000  # per source cap
+
+raw_samples <- list(
+  blogs   = read_sample_lines(files["blogs"],   p = P_SAMPLE, max_lines = MAX_LINES),
+  news    = read_sample_lines(files["news"],    p = P_SAMPLE, max_lines = MAX_LINES),
+  twitter = read_sample_lines(files["twitter"], p = P_SAMPLE, max_lines = MAX_LINES)
+)
+
+clean_samples <- lapply(raw_samples, clean_text)
+
+#Summary of sampled sizes
+data.table(
+  source = names(clean_samples),
+  sampled_lines = as.integer(sapply(clean_samples, length))
+)
+```
+# Distribution of words per line (histograms)
+
+## These plots help understand text “shape” by source.
+
+```{r ngrams-top, echo=FALSE}
+# n-gram builders (fast enough for sampled EDA)
+make_ngrams <- function(lines, n) {
+  toks <- str_split(lines, "\\s+")
+  grams <- vector("list", length(toks))
+  for (i in seq_along(toks)) {
+    w <- toks[[i]]
+    if (length(w) < n) next
+    idx <- seq_len(length(w) - n + 1)
+    grams[[i]] <- vapply(idx, function(j) paste(w[j:(j + n - 1)], collapse = " "),
+                         character(1))
+  }
+  unlist(grams, use.names = FALSE)
+}
+
+count_ngrams <- function(lines, n, top_k = 20) {
+  g <- make_ngrams(lines, n)
+  data.table(ngram = g)[, .N, by = ngram][order(-N)][1:top_k]
+}
+
+# Top 20 unigrams
+top_uni <- rbindlist(lapply(names(clean_samples), function(src) {
+  dt <- count_ngrams(clean_samples[[src]], 1, top_k = 20)
+  dt[, source := src]
+  dt
+}))
+
+top_uni  # table
+
+ggplot(top_uni, aes(x = reorder(ngram, N), y = N)) +
+  geom_col() +
+  coord_flip() +
+  facet_wrap(~ source, scales = "free") +
+  labs(title = "Top 20 unigrams by source (sampled, cleaned)", x = "", y = "Frequency")
+
+# Top 20 bigrams
+top_bi <- rbindlist(lapply(names(clean_samples), function(src) {
+  dt <- count_ngrams(clean_samples[[src]], 2, top_k = 20)
+  dt[, source := src]
+  dt
+}))
+
+top_bi  # table
+
+ggplot(top_bi, aes(x = reorder(ngram, N), y = N)) +
+  geom_col() +
+  coord_flip() +
+  facet_wrap(~ source, scales = "free") +
+  labs(title = "Top 20 bigrams by source (sampled, cleaned)", x = "", y = "Frequency")
+```
+
+
+## Vocabulary coverage summary (table)
+```{r vocab-coverage-summary, echo=FALSE}
+all_text <- unlist(clean_samples, use.names = FALSE)
+all_tokens <- unlist(strsplit(all_text, "\\s+"), use.names = FALSE)
+all_tokens <- all_tokens[nzchar(all_tokens)]
+
+dt_tokens <- data.table(word = all_tokens)[, .N, by = word][order(-N)]
+dt_tokens[, cum_prop := cumsum(N) / sum(N)]
+
+dt_tokens$rank <- as.integer(seq.int(nrow(dt_tokens)))
+
+words_for_50pct <- dt_tokens$rank[which(dt_tokens$cum_prop >= 0.50)[1]]
+words_for_90pct <- dt_tokens$rank[which(dt_tokens$cum_prop >= 0.90)[1]]
+
+data.table(
+  total_tokens = sum(dt_tokens$N),
+  unique_words = nrow(dt_tokens),
+  words_for_50pct = words_for_50pct,
+  words_for_90pct = words_for_90pct
+)
+```
+
+## C) Vocabulary coverage plot
+```{r vocab-coverage-plot, echo=FALSE}
+dt_plot <- dt_tokens[rank <= min(5000L, nrow(dt_tokens))]
+
+ggplot(dt_plot, aes(x = rank, y = cum_prop)) +
+  geom_line() +
+  labs(
+    title = "Cumulative token coverage vs. dictionary size (sampled)",
+    x = "Number of unique words (sorted by frequency)",
+    y = "Cumulative share of tokens"
+  )
+```
+# Plan for Task 3–7 (brief)
+Prediction model approach
+The production model will use n-grams (2-gram, 3-gram, 4-gram) with a backoff strategy:
+Use last 3 words to query 4-grams
+Back off to last 2 words (3-grams), then last 1 word (bigrams)
+Fall back to common unigrams when no match exists
+Efficiency considerations
+
+To support deployment on shinyapps.io / Posit Connect:
+sample data for training (or prune rare n-grams)
+store compact lookup tables
+ensure prediction runs quickly (low latency)
+
+Profanity filtering (optional enhancement) - A profanity list can be used to remove offensive tokens from candidate predictions without deleting them from training text entirely.
+
+# Appendix: Session info
+
+sessionInfo()

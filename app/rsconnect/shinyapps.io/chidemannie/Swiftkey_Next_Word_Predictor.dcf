@@ -1,0 +1,13 @@
+name: Swiftkey_Next_Word_Predictor
+title: Swiftkey_Next_Word_Predictor
+username: chidemannie
+account: chidemannie
+server: shinyapps.io
+hostUrl: https://api.shinyapps.io/v1
+appId: 16691034
+bundleId: 11592495
+url: https://chidemannie.shinyapps.io/Swiftkey_Next_Word_Predictor/
+version: 1
+asMultiple: FALSE
+asStatic: FALSE
+ignoredFiles: ._bigram.rds|._fourgram.rds|._trigram.rds
