@@ -14,6 +14,7 @@ This repository contains my completion of the Johns Hopkins Data Science Special
 ## How it works (high level)
 The predictor uses a frequency-based n-gram model (2-, 3-, 4-grams) with a backoff strategy:
 4-gram → 3-gram → 2-gram → fallback word. It is designed for small size and fast prediction in shiny
+- Slide deck: https://rpubs.com/chidemannie/SNxWoP
 
 ## How to run locally
 1. Clone this repo
